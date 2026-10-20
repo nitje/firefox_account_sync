@@ -1,0 +1,102 @@
+map $http_x_forwarded_proto $upstream_scheme {
+    default $http_x_forwarded_proto;
+    "" $scheme;
+}
+server {
+  listen 80 default_server;
+  server_name ${FXA_CONTENT_HOST};
+  client_max_body_size 10m;
+  location / {
+    proxy_pass http://fxa-content-server:3030;
+    # FxA 1.342.2 erzeugt Script-/CSS-Tags serverseitig weiterhin mit Mozillas CDN,
+    # auch wenn das gebaute React-Manifest bereits umgeschrieben wurde.
+    # NPM terminiert HTTPS; intern kein komprimiertes HTML anfordern, damit
+    # ngx_http_sub_module die tatsaechlich gelieferte HTML-Antwort filtern kann.
+    proxy_set_header Accept-Encoding "";
+    sub_filter_once off;
+    # Standard-sub_filter greift NUR bei text/html. Die Webpack-Laufzeit im
+    # JS kann die URL fuer nachgeladene 6901.*.chunk.js auf Mozilla-CDN setzen.
+    # Deshalb auch gelieferte JS/CSS/JSON-Texte umschreiben.
+    sub_filter_types application/javascript text/javascript application/x-javascript text/css application/json;
+    sub_filter 'https://cdn.accounts.firefox.com' 'https://$host';
+    # Stale JS unter gleichbleibendem Dateinamen/Hash nach dem Patch vermeiden;
+    # nur experimenteller FxA-Account-Proxy, nicht Syncstorage.
+    proxy_hide_header ETag;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header Expires;
+    add_header Cache-Control "no-store" always;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+}
+server {
+  listen 80;
+  server_name ${FXA_AUTH_HOST} ${FXA_OAUTH_HOST};
+  # Resolve at request time: manager restart must not prevent Nginx from starting.
+  resolver 127.0.0.11 valid=10s ipv6=off;
+  location = /__registration_gate {
+    internal;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    set $fxa_gate_host manager:8080;
+    proxy_pass http://$fxa_gate_host/internal/registration-allow;
+  }
+  location @registration_closed {
+    default_type application/json;
+    return 403 '{"error":"Forbidden","message":"Account registration disabled by administrator"}';
+  }
+  # Only the documented FxA v1 signup-creation endpoints are gated;
+  # do not block login, verification, OAuth, tokenserver or existing Sync.
+  # Signup POSTs only: gate reads email from JSON body and enforces manager policy.
+  # OPTIONS/CORS also passes the gate to preserve the original FxA responses.
+  location = /v1/account/create {
+    proxy_pass http://fxa-signup-gate:8090;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  # Reversible per-account NEW sign-in block: only the password-login POST.
+  # Do not intercept existing sessions, OAuth refresh, Sync, or verified devices.
+  location = /v1/account/login {
+    proxy_pass http://fxa-signup-gate:8090;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  location = /v1/account/stub {
+    auth_request /__registration_gate;
+    error_page 403 = @registration_closed;
+    proxy_pass http://fxa-auth-server:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  location / {
+    proxy_pass http://fxa-auth-server:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+}
+server {
+  listen 80;
+  server_name ${FXA_PROFILE_HOST};
+  location ^~ /img/ {
+    proxy_pass http://fxa-profile-static:1112/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+  }
+  location / {
+    proxy_pass http://fxa-profile-server:1111;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $upstream_scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+}

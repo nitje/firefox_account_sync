@@ -1,0 +1,622 @@
+# v0.6.1 TEST – FxA 1.346.7 Pairing-v2 probe. Based exactly on v0.6.0.
+# Only fxa-content-server uses 1.346.7; DB migrations/auth/profile stay on the existing FXA_VERSION (normally 1.342.2).
+# Host requires Docker + Docker Compose ONLY. No host Python or host init script.
+name: firefox_account_sync
+
+x-fxa-image: &fxa-image mozilla/fxa-mono:${FXA_VERSION:-v1.342.2}
+# Controlled iOS Pairing-v2 test: frontend/content only. This avoids running 1.346.7 DB migrations on the live FxA database.
+x-fxa-content-test-image: &fxa-content-test-image mozilla/fxa-mono:v1.346.7
+x-fxa-mysql: &fxa-mysql
+  AUTH_MYSQL_HOST: fxa-db
+  PROFILE_MYSQL_HOST: fxa-db
+  OAUTH_MYSQL_HOST: fxa-db
+  PUSHBOX_MYSQL_HOST: fxa-db
+  MYSQL_HOST: fxa-db
+  MYSQL_USER: fxa
+  # Legacy OAuth (auth-server) / profile-server use MYSQL_USERNAME, NOT MYSQL_USER.
+  MYSQL_USERNAME: fxa
+  MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+  AUTH_MYSQL_USERNAME: fxa
+  AUTH_MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+  PROFILE_MYSQL_USERNAME: fxa
+  PROFILE_MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+  OAUTH_MYSQL_USERNAME: fxa
+  OAUTH_MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+  PUSHBOX_MYSQL_USERNAME: fxa
+  PUSHBOX_MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+
+services:
+  sync-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SYNC_DB_ROOT_PASSWORD:?SYNC_DB_ROOT_PASSWORD fehlt}
+      MYSQL_DATABASE: syncstorage
+      MYSQL_USER: sync
+      MYSQL_PASSWORD: ${SYNC_DB_PASSWORD:?SYNC_DB_PASSWORD fehlt}
+    volumes: [sync_db_data:/var/lib/mysql]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -usync -Nse "SELECT 1" >/dev/null 2>&1']
+      interval: 10s
+      timeout: 6s
+      retries: 24
+      start_period: 50s
+    security_opt: ["no-new-privileges:true"]
+
+  token-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${TOKEN_DB_ROOT_PASSWORD:?TOKEN_DB_ROOT_PASSWORD fehlt}
+      MYSQL_DATABASE: tokenserver
+      MYSQL_USER: token
+      MYSQL_PASSWORD: ${TOKEN_DB_PASSWORD:?TOKEN_DB_PASSWORD fehlt}
+    volumes: [token_db_data:/var/lib/mysql]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -utoken -Nse "SELECT 1" >/dev/null 2>&1']
+      interval: 10s
+      timeout: 6s
+      retries: 24
+      start_period: 50s
+    security_opt: ["no-new-privileges:true"]
+
+  syncserver:
+    image: ghcr.io/mozilla-services/syncstorage-rs/syncserver-mysql:${SYNC_VERSION:-0.23.3}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      sync-db: {condition: service_healthy}
+      token-db: {condition: service_healthy}
+    environment:
+      SYNC_HOST: 0.0.0.0
+      SYNC_PORT: "8000"
+      SYNC_MASTER_SECRET: ${SYNC_MASTER_SECRET:?SYNC_MASTER_SECRET fehlt}
+      SYNC_SYNCSTORAGE__DATABASE_URL: mysql://sync:${SYNC_DB_PASSWORD:?SYNC_DB_PASSWORD fehlt}@sync-db:3306/syncstorage
+      SYNC_TOKENSERVER__DATABASE_URL: mysql://token:${TOKEN_DB_PASSWORD:?TOKEN_DB_PASSWORD fehlt}@token-db:3306/tokenserver
+      SYNC_TOKENSERVER__ENABLED: "true"
+      SYNC_TOKENSERVER__NODE_TYPE: mysql
+      SYNC_TOKENSERVER__RUN_MIGRATIONS: "true"
+      SYNC_TOKENSERVER__INIT_NODE_URL: ${SYNC_PUBLIC_URL:?SYNC_PUBLIC_URL fehlt}
+      SYNC_TOKENSERVER__FXA_EMAIL_DOMAIN: api.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      # Internal verification: no Mozilla fallback; do not require container to trust NPM's internal CA.
+      SYNC_TOKENSERVER__FXA_OAUTH_SERVER_URL: http://fxa-auth-server:9000
+      SYNC_TOKENSERVER__FXA_METRICS_HASH_SECRET: ${SYNC_METRICS_HASH_SECRET:?SYNC_METRICS_HASH_SECRET fehlt}
+      RUST_LOG: info
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${SYNC_HTTP_PORT:-18080}:8000"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/__heartbeat__"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    security_opt: ["no-new-privileges:true"]
+
+  manager:
+    build: ./manager
+    labels:
+      org.opencontainers.image.version: "0.6.0"
+    restart: unless-stopped
+    environment:
+      ADMIN_USER: ${ADMIN_USER:?ADMIN_USER fehlt}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+      BACKUP_AGENT_URL: http://backup-admin:8091
+      RESTORE_AGENT_URL: http://restore-admin:8092
+      SYNC_HEALTH_URL: http://syncserver:8000/__heartbeat__
+      FXA_DISCOVERY_HEALTH_URL: http://fxa-content-server:3030/.well-known/fxa-client-configuration
+      FXA_AUTH_HEALTH_URL: http://fxa-auth-server:9000/
+      SYNC_PUBLIC_URL: ${SYNC_PUBLIC_URL:?SYNC_PUBLIC_URL fehlt}
+      FXA_CONTENT_URL: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_OAUTH_URL: https://oauth.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      MANAGER_PUBLIC_URL: ${MANAGER_PUBLIC_URL:-}
+      MANAGER_HTTP_PORT_DISPLAY: ${MANAGER_HTTP_PORT:-18081}
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${MANAGER_HTTP_PORT:-18081}:8080"
+    networks: [backend]
+    read_only: true
+    volumes:
+      - backup_status:/backup-status:ro
+      - manager_state:/manager-state
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=5)"]
+      interval: 30s
+      timeout: 7s
+      retries: 4
+      start_period: 15s
+
+  # Image build fetches community selfhosting CONFIG TEMPLATES; no host scripts involved.
+  fxa-bootstrap:
+    build:
+      context: ./fxa-bootstrap
+      args:
+        SELFHOST_REF: ${FXA_SELFHOST_REF:-master}
+    platform: linux/amd64
+    restart: "no"
+    environment:
+      FXA_BASE_DOMAIN: ${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_VERSION: ${FXA_VERSION:-v1.342.2}
+      FXA_AUTH_SECRET: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt}
+      FXA_FLOW_KEY: ${FXA_FLOW_KEY:?FXA_FLOW_KEY fehlt}
+      FXA_PROFILE_SECRET: ${FXA_PROFILE_SECRET:?FXA_PROFILE_SECRET fehlt}
+      FXA_DB_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt}
+    volumes: [fxa_generated:/generated]
+    networks: [backend]
+
+  fxa-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    depends_on:
+      fxa-bootstrap: {condition: service_completed_successfully}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${FXA_DB_ROOT_PASSWORD:?FXA_DB_ROOT_PASSWORD fehlt}
+      MYSQL_DATABASE: fxa
+      MYSQL_USER: fxa
+      MYSQL_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt}
+    command: ["--event-scheduler=ON", "--mysql-native-password=ON", "--authentication_policy=mysql_native_password"]
+    volumes:
+      - fxa_db_data:/var/lib/mysql
+      - fxa_generated:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -ufxa -Nse "SELECT 1" >/dev/null 2>&1']
+      interval: 10s
+      timeout: 7s
+      retries: 36
+      start_period: 90s
+    security_opt: ["no-new-privileges:true"]
+
+  fxa-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [backend]
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes: [fxa_redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_UI_AUTH: ${ADMIN_USER:?ADMIN_USER fehlt}:${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_MAX_MESSAGES: "1000"
+    volumes: [fxa_mail_data:/data]
+    ports: ["${BIND_ADDRESS:-0.0.0.0}:${MAILPIT_HTTP_PORT:-18086}:8025"]
+    networks: [backend]
+    # SMTP port 1025 stays INSIDE Docker. Mailpit captures verification codes (TEST ONLY).
+
+  # One-shot: grant SELECT on accounts only. No write credentials enter the manager.
+  # Independent of the working FxA/Sync startup path; if grants fail, only the
+  # manager's optional user inventory is degraded.
+  fxa-manager-readonly-grants:
+    image: mysql:8.4
+    restart: "no"
+    depends_on:
+      fxa-db-migrations: {condition: service_completed_successfully}
+    environment:
+      FXA_DB_ROOT_PASSWORD: ${FXA_DB_ROOT_PASSWORD:?FXA_DB_ROOT_PASSWORD fehlt}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+    volumes:
+      - ./manager/grant-readonly.sh:/opt/manager/grant-readonly.sh:ro
+    command: ["/bin/sh", "/opt/manager/grant-readonly.sh"]
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  # Email-based signup + UID-resolved new-login gate; read-only FxA DB user.
+  # NO token revocation, no existing-session or Sync blocking.
+  fxa-signup-gate:
+    build: ./signup-gate
+    restart: unless-stopped
+    environment:
+      FXA_CONTENT_URL: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      # Reuse the EXISTING .env value used by manager and readonly grant job.
+      # No new seed and no .env modifications required on UGOS.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+    volumes:
+      - manager_state:/manager-state:ro
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/healthz',timeout=5)"]
+      interval: 30s
+      timeout: 7s
+      retries: 4
+      start_period: 15s
+
+  # No published ports. Dumps go to ./backups/; a non-sensitive status JSON
+  # lives in a separate named volume so the unprivileged manager can display it.
+  backup:
+    build: ./backup
+    restart: unless-stopped
+    user: "0:0"
+    depends_on:
+      fxa-db-migrations: {condition: service_completed_successfully}
+      fxa-db: {condition: service_healthy}
+      sync-db: {condition: service_healthy}
+      token-db: {condition: service_healthy}
+    environment:
+      FXA_DB_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt}
+      SYNC_DB_PASSWORD: ${SYNC_DB_PASSWORD:?SYNC_DB_PASSWORD fehlt}
+      TOKEN_DB_PASSWORD: ${TOKEN_DB_PASSWORD:?TOKEN_DB_PASSWORD fehlt}
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-true}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./.env:/project/.env:ro
+      - ./backups:/backups
+      - backup_status:/backup-status
+      - restore_status:/restore-status:ro
+      - fxa_auth_keys:/data/volumes/fxa-keys:ro
+      - fxa_generated:/data/volumes/fxa-generated:ro
+      - fxa_profile_images:/data/volumes/fxa-profile-images:ro
+      - manager_state:/data/volumes/manager-state:ro
+    command: ["/bin/sh", "/opt/backup/run.sh", "daemon"]
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  # Backup inventory / safe deletion only; deliberately NOT published on host/NPM.
+  # Only this narrowly mounted container can remove completed backup folders.
+  backup-admin:
+    build: ./backup-admin
+    restart: unless-stopped
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+    volumes:
+      - ./backups:/backups
+      - restore_status:/restore-status:ro
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 7s
+      retries: 4
+      start_period: 15s
+
+  # Offline restore coordinator. No Docker socket and no published port.
+  # Restore is allowed only after the write-capable FxA/Sync services are stopped in UGOS.
+  restore-admin:
+    build: ./restore-admin
+    restart: unless-stopped
+    user: "0:0"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt}
+      FXA_DB_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt}
+      SYNC_DB_PASSWORD: ${SYNC_DB_PASSWORD:?SYNC_DB_PASSWORD fehlt}
+      TOKEN_DB_PASSWORD: ${TOKEN_DB_PASSWORD:?TOKEN_DB_PASSWORD fehlt}
+      FXA_BASE_DOMAIN: ${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_VERSION: ${FXA_VERSION:-v1.342.2}
+      FXA_AUTH_SECRET: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt}
+      FXA_FLOW_KEY: ${FXA_FLOW_KEY:?FXA_FLOW_KEY fehlt}
+      FXA_PROFILE_SECRET: ${FXA_PROFILE_SECRET:?FXA_PROFILE_SECRET fehlt}
+      SYNC_VERSION: ${SYNC_VERSION:-0.23.3}
+      SYNC_MASTER_SECRET: ${SYNC_MASTER_SECRET:?SYNC_MASTER_SECRET fehlt}
+      SYNC_METRICS_HASH_SECRET: ${SYNC_METRICS_HASH_SECRET:?SYNC_METRICS_HASH_SECRET fehlt}
+      SYNC_PUBLIC_URL: ${SYNC_PUBLIC_URL:?SYNC_PUBLIC_URL fehlt}
+    volumes:
+      - ./.env:/project/.env:ro
+      - ./backups:/backups
+      - restore_status:/restore-status
+      - fxa_auth_keys:/restore-volumes/fxa-keys
+      - fxa_generated:/restore-volumes/fxa-generated
+      - fxa_profile_images:/restore-volumes/fxa-profile-images
+      - manager_state:/restore-volumes/manager-state
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  # Verify all four FxA schemas with exactly the .env user/password before running migrations.
+  # This does not alter grants, passwords, or volumes and does not need MySQL root.
+  fxa-db-check:
+    image: mysql:8.4
+    restart: "no"
+    depends_on:
+      fxa-db: {condition: service_healthy}
+    environment:
+      FXA_DB_PASSWORD: ${FXA_DB_PASSWORD:?FXA_DB_PASSWORD fehlt in .env}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        for db in fxa fxa_oauth fxa_profile pushbox; do
+          echo "Pruefe Zugriff als fxa auf Datenbank: $$db"
+          MYSQL_PWD="$$FXA_DB_PASSWORD" mysql --connect-timeout=10 -h fxa-db -ufxa -D "$$db" -Nse 'SELECT 1' >/dev/null || {
+            echo "FEHLER: Kein fxa-Zugriff auf $$db. Bestehende .env, DB-Volume und Init-GRANTs pruefen; KEIN down -v!" >&2
+            exit 1
+          }
+        done
+        echo 'FxA DB-Check erfolgreich: fxa, fxa_oauth, fxa_profile, pushbox.'
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  fxa-db-migrations:
+    image: *fxa-image
+    platform: linux/amd64
+    working_dir: /fxa/packages/db-migrations
+    command: ["node", "./bin/patcher.mjs"]
+    restart: "no"
+    depends_on:
+      fxa-db-check: {condition: service_completed_successfully}
+      fxa-redis: {condition: service_healthy}
+    environment:
+      <<: *fxa-mysql
+      AUTH_MYSQL_DATABASE: fxa
+      PROFILE_MYSQL_DATABASE: fxa_profile
+      OAUTH_MYSQL_DATABASE: fxa_oauth
+      PUSHBOX_MYSQL_DATABASE: pushbox
+      MYSQL_DATABASE: fxa
+    networks: [backend]
+
+  fxa-auth-server:
+    image: *fxa-image
+    platform: linux/amd64
+    user: "0:0" # FxA upstream key scripts write local keys; keys copied to volume on boot.
+    working_dir: /fxa/packages/fxa-auth-server/dist/packages/fxa-auth-server
+    restart: unless-stopped
+    depends_on:
+      fxa-db-migrations: {condition: service_completed_successfully}
+      fxa-redis: {condition: service_healthy}
+      mailpit: {condition: service_started}
+    volumes:
+      - fxa_generated:/fxa-generated:ro
+      - fxa_auth_keys:/fxa-keys
+    environment:
+      <<: *fxa-mysql
+      # This service has two DB clients: new auth (AUTH_*) and legacy OAuth (MYSQL_*).
+      AUTH_MYSQL_DATABASE: fxa
+      MYSQL_DATABASE: fxa_oauth
+      REDIS_HOST: fxa-redis
+      ACCESS_TOKEN_REDIS_HOST: fxa-redis
+      REFRESH_TOKEN_REDIS_HOST: fxa-redis
+      CUSTOMS_REDIS_HOST: fxa-redis
+      METRICS_REDIS_HOST: fxa-redis
+      AUTH_CACHE_REDIS_HOST: fxa-redis
+      RECOVERY_PHONE_REDIS_HOST: fxa-redis
+      RATELIMIT_REDIS_HOST: fxa-redis
+      PASSKEY_REDIS_HOST: fxa-redis
+      DB: mysql
+      DB_AUTO_UPDATE_CLIENTS: "true"
+      IP_ADDRESS: 0.0.0.0
+      OAUTH_SERVER_SECRET_KEY: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt}
+      OAUTH_SERVER_SECRETS: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt}
+      AUTH_SERVER_SHARED_SECRET: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt}
+      AUTH_SERVER_SECRETS: ${FXA_AUTH_SECRET:?FXA_AUTH_SECRET fehlt},realwhatever
+      PROFILE_SERVER_AUTH_SECRET_BEARER_TOKEN: ${FXA_PROFILE_SECRET:?FXA_PROFILE_SECRET fehlt}
+      FLOW_ID_KEY: ${FXA_FLOW_KEY:?FXA_FLOW_KEY fehlt}
+      ISSUER: api.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      PUBLIC_URL: https://api.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      OAUTH_URL: https://oauth.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      CONTENT_URL: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      CONTENT_SERVER_URL: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      SYNC_TOKENSERVER_URL: ${SYNC_PUBLIC_URL:?SYNC_PUBLIC_URL fehlt}
+      PROFILE_SERVER_URL: http://fxa-profile-server:1111
+      FXA_OPENID_ISSUER: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      SNS_TOPIC_ARN: disabled
+      PUSHBOX_ENABLED: "true"
+      PUSHBOX_MYSQL_HOST: fxa-db
+      CUSTOMS_SERVER_URL: none
+      FXA_OPENID_KEYFILE: config/key.json
+      FXA_OPENID_NEWKEYFILE: config/newKey.json
+      FXA_OPENID_OLDKEYFILE: config/oldKey.json
+      SMTP_SENDER: Firefox Sync <noreply@${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}>
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_IGNORE_TLS: "true"
+      SMTP_USER: local
+      SMTP_PASS: local
+      GEODB_ENABLED: "false"
+      LOG_LEVEL: WARN
+      LASTACCESSTIME_UPDATES_SAMPLE_RATE: "1"
+      ACCOUNT_EVENTS_ENABLED: "false"
+      FXA_EXPIRATION_ACCESS_TOKEN: 7 days
+      AUTH_GLEAN_ENABLED: "false"
+      CORS_ORIGIN: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      RECOVERY_PHONE__TWILIO__CREDENTIAL_MODE: ""
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cp /fxa-generated/oauthserver-prod.json config/prod.json
+        if [ -f /fxa-keys/key.json ]; then
+          cp /fxa-keys/*.json config/
+        else
+          node scripts/gen_keys.js
+          node scripts/oauth_gen_keys.js
+          node scripts/gen_vapid_keys.js
+          find config -maxdepth 1 -type f -name '*ey*.json' -exec cp '{}' /fxa-keys/ \;
+        fi
+        # FxA 1.342.2 community selfhosting compatibility workarounds.
+        sed -i 's/typedi_1.Container.get(cms_1.RelyingPartyConfigurationManager)/typedi_1.Container.has(cms_1.RelyingPartyConfigurationManager)?typedi_1.Container.get(cms_1.RelyingPartyConfigurationManager):null/' lib/routes/cms.js
+        sed -i 's/typedi_1.Container.get(cms_1.DefaultCmsConfigurationManager)/typedi_1.Container.has(cms_1.DefaultCmsConfigurationManager)?typedi_1.Container.get(cms_1.DefaultCmsConfigurationManager):null/' lib/routes/cms.js
+        sed -i '/async planIdsToClientCapabilities/a return {};' lib/payments/capability.js
+        exec node bin/key_server.js
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  fxa-profile-permissions:
+    image: *fxa-image
+    platform: linux/amd64
+    user: "0:0"
+    command: ["chmod", "a+w", "/fxa/packages/fxa-profile-server/var/public/"]
+    volumes: [fxa_profile_images:/fxa/packages/fxa-profile-server/var/public]
+    restart: "no"
+    networks: [backend]
+
+  fxa-profile-worker:
+    image: *fxa-image
+    platform: linux/amd64
+    working_dir: /fxa/packages/fxa-profile-server
+    command: ["node", "bin/worker.js"]
+    environment: {WORKER_HOST: "0.0.0.0", IMG: local}
+    depends_on:
+      fxa-profile-permissions: {condition: service_completed_successfully}
+    volumes: [fxa_profile_images:/fxa/packages/fxa-profile-server/var/public]
+    restart: unless-stopped
+    networks: [backend]
+
+  fxa-profile-static:
+    image: *fxa-image
+    platform: linux/amd64
+    working_dir: /fxa/packages/fxa-profile-server
+    command: ["node", "bin/_static.js"]
+    environment: {HOST: "0.0.0.0", IMG: local}
+    volumes: [fxa_profile_images:/fxa/packages/fxa-profile-server/var/public:ro]
+    restart: unless-stopped
+    networks: [backend]
+
+  fxa-profile-server:
+    image: *fxa-image
+    platform: linux/amd64
+    working_dir: /fxa/packages/fxa-profile-server
+    command: ["node", "bin/server.js"]
+    depends_on:
+      fxa-db-migrations: {condition: service_completed_successfully}
+      fxa-auth-server: {condition: service_started}
+      fxa-redis: {condition: service_healthy}
+      fxa-profile-permissions: {condition: service_completed_successfully}
+    environment:
+      <<: *fxa-mysql
+      # Profile's lib/config.js uses MYSQL_USERNAME / MYSQL_DATABASE directly.
+      MYSQL_DATABASE: fxa_profile
+      AUTH_SECRET_BEARER_TOKEN: ${FXA_PROFILE_SECRET:?FXA_PROFILE_SECRET fehlt}
+      EVENTS_ENABLED: "false"
+      HOST: 0.0.0.0
+      DB: mysql
+      IMG_PROVIDERS_FXA: ^https://profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}/img/a/[0-9a-f]{32}$$
+      IMG_URL: https://profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}/img/a/{id}
+      PUBLIC_URL: https://profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      IMG: local
+      AUTH_SERVER_URL: http://fxa-auth-server:9000/v1
+      OAUTH_SERVER_URL: http://fxa-auth-server:9000/v1
+      REDIS_HOST: fxa-redis
+      WORKER_URL: http://fxa-profile-worker:1113
+    volumes: [fxa_profile_images:/fxa/packages/fxa-profile-server/var/public]
+    restart: unless-stopped
+    networks: [backend]
+
+  fxa-content-server:
+    # TEST ONLY: Pairing-v2 capable content/frontend from FxA 1.346.7.
+    # Auth, profile and DB migrations deliberately remain on the stable x-fxa-image.
+    image: *fxa-content-test-image
+    platform: linux/amd64
+    working_dir: /fxa/packages/fxa-content-server
+    restart: unless-stopped
+    depends_on:
+      fxa-auth-server: {condition: service_started}
+      fxa-profile-server: {condition: service_started}
+      fxa-bootstrap: {condition: service_completed_successfully}
+    volumes: [fxa_generated:/fxa-generated:ro]
+    environment:
+      CONFIG_FILES: /fxa/packages/fxa-content-server/config/prod.json
+      FXA_OAUTH_CLIENT_ID: ea3ca969f8c6bb0d
+      FLOW_ID_KEY: ${FXA_FLOW_KEY:?FXA_FLOW_KEY fehlt}
+      FEATURE_FLAGS_REDIS_HOST: fxa-redis
+      SYNC_TOKENSERVER_URL: ${SYNC_PUBLIC_URL:?SYNC_PUBLIC_URL fehlt}
+      PUBLIC_URL: https://accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_OAUTH_URL: https://oauth.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_URL: https://api.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_PROFILE_URL: https://profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_PROFILE_IMAGES_URL: https://profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_MARKETING_EMAIL_ENABLED: "false"
+      GEODB_ENABLED: "false"
+      LOG_LEVEL: WARN
+      NODE_ENV: production
+      STATIC_DIRECTORY: dist
+      PAGE_TEMPLATE_SUBDIRECTORY: dist
+      CSP_ENABLED: "true"
+      FXA_MX_RECORD_VALIDATION: "false" # Mailpit for local verification only; not real mail delivery.
+      REDIRECT_CHECK_ALLOW_LIST: '*.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}'
+      APPLE_AUTH_ENABLED: "false"
+      GOOGLE_AUTH_ENABLED: "false"
+      GLEAN_UPLOAD_ENABLED: "false"
+      CONTENT_SERVER_GLEAN_ENABLED: "false"
+      REACT_CONVERSION_SIGNUP_ROUTES: "true"
+      REACT_CONVERSION_SIGNIN_ROUTES: "true"
+      REACT_CONVERSION_SIMPLE_ROUTES: "true"
+      REACT_CONVERSION_RESET_PASSWORD_ROUTES: "true"
+      REACT_CONVERSION_POST_VERIFY_THIRD_PARTY_AUTH: "true"
+      REACT_CONVERSION_EMAIL_FIRST_ROUTES: "true"
+      # FxA 1.346.7: enable both legacy React pairing entry routes and the new Pairing-v2 authority/supplicant routes.
+      REACT_CONVERSION_PAIR_ROUTES: "true"
+      REACT_CONVERSION_PAIR2_ROUTES: "true"
+      # Do not expose the throwaway pairing proof-of-concept routes during this test.
+      REACT_CONVERSION_POC_PAIRING_ROUTES: "false"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cp /fxa-generated/contentserver-prod.json config/prod.json
+        # FxA frontend: HTML plus initial JS reichen NICHT; Webpack-Chunks
+        # koennen ihren publicPath in anderen JS-Bundles fest hinterlegt haben.
+        # Beim Containerstart ALLE lokalen Settings-Textassets bearbeiten.
+        assets='./dist/settings/prod'
+        test -f "$$assets/asset-manifest.json"
+        test -f "$$assets/index.html"
+        set -- "$$assets"/static/js/main.*
+        test -f "$$1"
+        find "$$assets" -type f \( -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.json' \) \
+          -exec grep -l -F 'https://cdn.accounts.firefox.com' {} + | \
+          while IFS= read -r asset; do
+            sed -i "s|https://cdn.accounts.firefox.com|$${PUBLIC_URL}|g" "$$asset"
+            echo "FxA CDN-Patch: $$asset"
+          done
+        if find "$$assets" -type f \( -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.json' \) \
+          -exec grep -l -F 'https://cdn.accounts.firefox.com' {} + | grep -q .; then
+          echo 'ERROR: Mozilla-CDN in lokalen Settings-Textassets verblieben' >&2
+          exit 1
+        fi
+        echo 'FxA frontend HTML + JS + dynamische Chunks CDN-frei (0.3.6)'
+        exec node server/bin/fxa-content-server.js
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+  fxa-proxy:
+    build: ./fxa-proxy
+    restart: unless-stopped
+    depends_on:
+      fxa-content-server: {condition: service_started}
+      fxa-auth-server: {condition: service_started}
+      fxa-profile-server: {condition: service_started}
+      fxa-profile-static: {condition: service_started}
+      fxa-signup-gate: {condition: service_healthy}
+    environment:
+      FXA_CONTENT_HOST: accounts.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_AUTH_HOST: api.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_OAUTH_HOST: oauth.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+      FXA_PROFILE_HOST: profile.${FXA_BASE_DOMAIN:?FXA_BASE_DOMAIN fehlt}
+    ports: ["${BIND_ADDRESS:-0.0.0.0}:${FXA_HTTP_PORT:-18082}:80"]
+    networks: [backend]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  sync_db_data:
+  token_db_data:
+  fxa_generated:
+  fxa_db_data:
+  fxa_redis_data:
+  fxa_auth_keys:
+  fxa_profile_images:
+  fxa_mail_data:
+  backup_status:
+  restore_status:
+  manager_state:
+
+networks:
+  backend:
+    driver: bridge
